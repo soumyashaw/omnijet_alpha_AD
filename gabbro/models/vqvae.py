@@ -533,7 +533,7 @@ class VQVAELightning(L.LightningModule):
 
         with torch.no_grad():
             if not hide_pbar:
-                pbar = tqdm(dataloader)
+                pbar = tqdm(dataloader, desc="Tokenizing Input Data")
             else:
                 pbar = dataloader
             for i, (x_batch, mask_batch) in enumerate(pbar):
