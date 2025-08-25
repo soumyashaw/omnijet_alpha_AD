@@ -4,12 +4,13 @@ import torch.optim as optim
 import torch.nn as nn
 
 # Anomaly Detection class imports
-from models import JetAnomalyDetector
+from models import TokenizationModule, JetAnomalyDetector
 
 # Example training setup
 def train():
     # Create model
-    model = JetAnomalyDetector()
+    tokenizer = TokenizationModule(use_pretrained_vqvae=True)
+    #model = JetAnomalyDetector(verbose=True)
 
     """# Loss and optimizer
     criterion = nn.CrossEntropyLoss()
