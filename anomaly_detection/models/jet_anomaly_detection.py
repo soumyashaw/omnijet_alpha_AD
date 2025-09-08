@@ -2,6 +2,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
 
 # System imports
@@ -32,6 +33,12 @@ from omegaconf import OmegaConf
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("train_tokenizer")
 
+def merge_tokenized_datasets(dataset1, dataset2):
+    merged = {}
+    for key in dataset1:
+        merged[key] = np.concatenate([dataset1[key], dataset2[key]], axis=0)
+    return merged
+
 class TokenizationModule(nn.Module):
     """
     Tokenization module for jet data.
@@ -46,9 +53,11 @@ class TokenizationModule(nn.Module):
         epochs=10,
         lr=1e-3,
         device=None,
+        label_type="Signal",
         vqvae_ckpt_path="../checkpoints/vqvae_8192_tokens/model_ckpt.ckpt",
         use_pretrained_vqvae=True,
         generate_tokens=True,
+        save_cache=True,
         verbose=False
     ):
         super().__init__()
@@ -65,14 +74,21 @@ class TokenizationModule(nn.Module):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.save_dir = os.path.join(save_dir, f"{generate_codenames()[0]}_{datetime.now().strftime('%Y%m%d')}")
 
+        self.particle_features_tokenized = None  # Initialize to avoid AttributeError
+
+        npz_path = os.path.join("cache", f"tokenized_{label_type.lower()}_data.npz")
+
+        if verbose:
+            print(f"\nProvided {label_type} dataset\n")
+
         if use_pretrained_vqvae:
             # ========== Frozen VQ-VAE Tokenizer (OmniJet-α style) ========== #
-            print(f"Loading Pre-trained VQ-VAE model from {vqvae_ckpt_path}")
+            print(f"\nLoading Pre-trained VQ-VAE model from {vqvae_ckpt_path}\n")
             self.vqvae_model = VQVAELightning.load_from_checkpoint(vqvae_ckpt_path)
             self.vqvae_model.to(self.device).eval()
             cfg = OmegaConf.load(Path(vqvae_ckpt_path).parent / "config.yaml")
             pp_dict = OmegaConf.to_container(cfg.data.dataset_kwargs_common.feature_dict)
-            print(f"Loaded VQ-VAE with {len(pp_dict)} features.")
+            print(f"\nLoaded VQ-VAE with {len(pp_dict)} features.\n")
 
             pp_dict_cuts = {
                     feat_name: {
@@ -101,41 +117,129 @@ class TokenizationModule(nn.Module):
             print(f"Ready to Train Tokenizer. Tokenizer will save checkpoints to {self.save_dir}")
 
         if generate_tokens:
-            print("Generating Tokens from Input Data")
-            #bg_file_path = os.path.join(data_path, "bg_N100.h5")
-            sig_file_path = os.path.join(data_path, "sn_N100.h5")
-            requested_features = ["part_pt", "part_etarel", "part_phirel"]
+            # Check if tokenized data already exists, then load if available
+            # Ask if user wants to use existing tokenized data
+            if os.path.exists(npz_path):
+                use_existing = input(f"Tokenized data found at {npz_path}. Do you want to use it? (y/n): ")
+            else:
+                use_existing = "n"
+            if use_existing.lower() == "y" and os.path.exists(npz_path):
+                print(f"\n\033[32mLoading tokenized data from {npz_path}\033[0m\n")
+                with np.load(npz_path) as data:
+                    self.particle_features_tokenized = {
+                        "jet1": np.asarray(data["jet1"]),
+                        "jet2": np.asarray(data["jet2"]),
+                        "labels": np.asarray(data["labels"])
+                }
+                    
+                # if verbose:   
+                print("Dimensionality of Jet1:", self.particle_features_tokenized["jet1"].shape)
+                print("Dimensionality of Jet2:", self.particle_features_tokenized["jet2"].shape)
 
-            x_particles, _ = self.data_loader(
-                data_path=sig_file_path,
-                particle_features=requested_features,
-                jet_features=None,
-            )
+            else:
+                # Tokenize Input Data if cached data not found
+                print("\nGenerating Tokens from Input Data\n")
+                bg_file_path = os.path.join(data_path, "bg_N100_SR_extra.h5")
+                sig_file_path = os.path.join(data_path, "sn_N100_SR.h5")
+                #label_type = 'Background'
+                requested_features = ["part_pt", "part_etarel", "part_phirel"]
 
-            # data_loader returns a dict with keys 'jet1' and 'jet2'. Select jet1
-            particle_features_ak = x_particles["jet1"]
+                if label_type == 'Signal':
+                    x_particles, _ = self.data_loader(
+                        data_path=sig_file_path,
+                        particle_features=requested_features,
+                        jet_features=None,
+                    )
+                elif label_type == 'Background':
+                    x_particles, _ = self.data_loader(
+                        data_path=bg_file_path,
+                        particle_features=requested_features,
+                        jet_features=None,
+                    )
 
-            print("Loaded particle features (jet1): fields=", getattr(particle_features_ak, "fields", None))
+                # data_loader returns a dict with keys 'jet1' and 'jet2'. Select jet1
+                particle_features_ak_jet1 = x_particles["jet1"]
+                particle_features_ak_jet2 = x_particles["jet2"]
 
-            # If build_particle_matrix returned an unnamed numeric ragged array
-            # (no fields), create a named-field awkward array as a fallback so
-            # ak_select_and_preprocess can index by feature name.
-            if not getattr(particle_features_ak, "fields", None) or "part_pt" not in particle_features_ak.fields:
-                print("particle_features_ak has no named fields, constructing named fields from columns")
-                # Each event in particle_features_ak is assumed to be an (n_const, n_feat) array-like
-                n_events = len(particle_features_ak)
-                ragged_fields = {}
-                for idx, name in enumerate(requested_features):
-                    # build per-event lists of column idx
-                    col = ak.Array([ (evt[:, idx] if len(evt) and evt.shape[1] > idx else []) for evt in particle_features_ak ])
-                    ragged_fields[name] = col
-                particle_features_ak = ak.zip(ragged_fields)
+                print("\nLoaded particle features (jet1): fields=", getattr(particle_features_ak_jet1, "fields", None))
+                print("Loaded particle features (jet2): fields=", getattr(particle_features_ak_jet2, "fields", None))
 
-            particle_features_ak = ak_select_and_preprocess(particle_features_ak, pp_dict_cuts)[:, :128]
+                # If build_particle_matrix returned an unnamed numeric ragged array
+                # (no fields), create a named-field awkward array as a fallback so
+                # ak_select_and_preprocess can index by feature name.
+                if not getattr(particle_features_ak_jet1, "fields", None) or "part_pt" not in particle_features_ak_jet1.fields:
+                    print("particle_features_ak has no named fields, constructing named fields from columns")
+                    # Each event in particle_features_ak is assumed to be an (n_const, n_feat) array-like
+                    n_events = len(particle_features_ak_jet1)
+                    ragged_fields = {}
+                    for idx, name in enumerate(requested_features):
+                        # build per-event lists of column idx
+                        col = ak.Array([ (evt[:, idx] if len(evt) and evt.shape[1] > idx else []) for evt in particle_features_ak_jet1 ])
+                        ragged_fields[name] = col
+                    particle_features_ak_jet1 = ak.zip(ragged_fields)
 
-            particle_features_ak_tokenized = self.tokenize_jets(particle_features_ak, pp_dict)
+                if not getattr(particle_features_ak_jet2, "fields", None) or "part_pt" not in particle_features_ak_jet2.fields:
+                    print("particle_features_ak has no named fields, constructing named fields from columns")
+                    # Each event in particle_features_ak is assumed to be an (n_const, n_feat) array-like
+                    n_events = len(particle_features_ak_jet2)
+                    ragged_fields = {}
+                    for idx, name in enumerate(requested_features):
+                        # build per-event lists of column idx
+                        col = ak.Array([ (evt[:, idx] if len(evt) and evt.shape[1] > idx else []) for evt in particle_features_ak_jet2 ])
+                        ragged_fields[name] = col
+                    particle_features_ak_jet2 = ak.zip(ragged_fields)
 
-            print(particle_features_ak_tokenized)
+                particle_features_ak_jet1 = ak_select_and_preprocess(particle_features_ak_jet1, pp_dict_cuts)[:, :128]
+                particle_features_ak_jet2 = ak_select_and_preprocess(particle_features_ak_jet2, pp_dict_cuts)[:, :128]
+
+                jet1 = self.tokenize_jets(particle_features_ak_jet1, pp_dict)
+                jet1 = ak.pad_none(jet1, pad_length, axis=1)
+                jet1 = ak.fill_none(jet1, 0)
+                jet1_np = ak.to_numpy(jet1)
+
+                jet2 = self.tokenize_jets(particle_features_ak_jet2, pp_dict)
+                jet2 = ak.pad_none(jet2, pad_length, axis=1)
+                jet2 = ak.fill_none(jet2, 0)
+                jet2_np = ak.to_numpy(jet2)
+
+                if label_type == 'Signal':
+                    labels = np.ones(jet1_np.shape[0])
+                elif label_type == 'Background':
+                    labels = np.zeros(jet1_np.shape[0])
+                else:
+                    raise ValueError(f"Unknown label type: {label_type}")
+
+                self.particle_features_tokenized = {"jet1": jet1_np, "jet2": jet2_np, "labels": labels}
+
+                if save_cache:
+                    # Save tokenized data to a compressed npz file
+                    np.savez_compressed(npz_path,
+                                        jet1=jet1_np,
+                                        jet2=jet2_np,
+                                        labels=labels)
+                    print(f"\n\033[32mSaved tokenized data to {npz_path}\n\033[0m")
+
+    def return_tokens(self):
+        print("Returning tokenized data of length", len(self.particle_features_tokenized))
+        return self.particle_features_tokenized
+    
+    def sample_jets(self, number):
+        if not self.particle_features_tokenized:
+            raise ValueError("No tokenized data available for sampling.")
+        print("Sampled jets:")
+        print("Jet1 shape:", self.particle_features_tokenized["jet1"].shape)
+        print("Jet2 shape:", self.particle_features_tokenized["jet2"].shape)
+        print("Label shape:", self.particle_features_tokenized["labels"].shape)
+        N = self.particle_features_tokenized["jet1"].shape[0]
+        idx = np.random.choice(N, size=number, replace=False)
+        jet1_samples = self.particle_features_tokenized["jet1"][idx]
+        jet2_samples = self.particle_features_tokenized["jet2"][idx]
+        label_samples = self.particle_features_tokenized["labels"][idx]
+        print("Sampled jets:")
+        print("Jet1 samples:", jet1_samples.shape)
+        print("Jet2 samples:", jet2_samples.shape)
+        print("Label samples:", label_samples.shape)
+        return {"jet1": jet1_samples, "jet2": jet2_samples, "labels": label_samples}
 
     @staticmethod
     def build_pp_dict():
@@ -515,14 +619,26 @@ class TokenizationModule(nn.Module):
             )
         # ak.Array of shape (N_jets, L)
         return tokens
+    
+class JetDataset(torch.utils.data.Dataset):
+    def __init__(self, tokenized_data, pad_length=128, pad_value=0):
+        self.jet1 = torch.from_numpy(tokenized_data["jet1"]).long()
+        self.jet2 = torch.from_numpy(tokenized_data["jet2"]).long()
+        self.labels = torch.from_numpy(tokenized_data["labels"]).reshape(-1, 1)
+    def __len__(self):
+        return self.jet1.shape[0]
+    def __getitem__(self, idx):
+        return {
+            "jet1": self.jet1[idx],
+            "jet2": self.jet2[idx],
+            "label": self.labels[idx]
+        }
 
 
 class JetAnomalyDetector(nn.Module):
     def __init__(
         self,
-        data_path="/net/data_ttk/hreyes/LHCO/processed_jg/original/",
-        vqvae_ckpt_path="../checkpoints/vqvae_8192_tokens/model_ckpt.ckpt",
-        use_pretrained_vqvae=True,
+        data,
         vocab_size=8194,
         embedding_dim=256,
         max_sequence_len_per_jet=128,
@@ -547,10 +663,12 @@ class JetAnomalyDetector(nn.Module):
         super().__init__()
 
         self.use_hlf = use_hlf
-        self.data_path = data_path
+        self.data = data
         self.verbose = verbose
         self.cls_token_id = cls_token_id
         self.embedding_dim = embedding_dim
+        self.use_sep_token = use_sep_token
+        self.jet_last_emb = jet_last_emb
         self.max_sequence_len_per_jet = max_sequence_len_per_jet
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.sep_token_id = sep_token_id if sep_token_id is not None else cls_token_id
@@ -595,8 +713,6 @@ class JetAnomalyDetector(nn.Module):
 
         # Criterion
         #self.criterion = nn.BCEWithLogitsLoss()
-
-
         
 
     def forward(self):
@@ -620,13 +736,17 @@ class JetAnomalyDetector(nn.Module):
 
         # ========== OmniJet-α Backbone ========== #
 
-        embeddings_jet1 = self.backbone(self.particle_features_ak_tokenized, mask1)
-        embeddings_jet2 = self.backbone(self.particle_features_ak_tokenized, mask2)
+        # Extract individual jets from provided data
+        jet1 = self.data["jet1"]  # (N, L)
+        jet2 = self.data["jet2"]  # (N, L)
+
+        embeddings_jet1 = self.backbone(jet1)
+        embeddings_jet2 = self.backbone(jet2)
 
         # ========== Downstream Anomaly Detection Head ========== #
 
         if self.use_hlf == False: # HLF = high-level features
-            if self.use_sep_token == 'True':
+            if self.use_sep_token:
                 batch_size = embeddings_jet1.size(0)
                 sep_token_expanded = self.sep_token.expand(batch_size, -1, -1)
 
