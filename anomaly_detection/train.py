@@ -16,16 +16,16 @@ from models import TokenizationModule, JetAnomalyDetector, JetDataset
 # Example training setup
 def train():
     # Create model
-    tokenized_data_signal = TokenizationModule(use_pretrained_vqvae=True, label_type="Signal").sample_jets(75000)
-    tokenized_data_background = TokenizationModule(use_pretrained_vqvae=True, label_type="Background").sample_jets(350000)
+    tokenized_data_signal = TokenizationModule(use_pretrained_vqvae=True, label_type="Signal").sample_jets(10000)
+    tokenized_data_background = TokenizationModule(use_pretrained_vqvae=True, label_type="Background").sample_jets(10000)
 
     # Split Signal Data into 50k and 25k split
-    tokenized_data_signal_50k = {key: value[:50000] for key, value in tokenized_data_signal.items()}  # 50k signal data
-    tokenized_data_signal_25k = {key: value[50000:] for key, value in tokenized_data_signal.items()}  # 25k signal data
+    tokenized_data_signal_50k = {key: value[:5000] for key, value in tokenized_data_signal.items()}  # 50k signal data
+    tokenized_data_signal_25k = {key: value[5000:] for key, value in tokenized_data_signal.items()}  # 25k signal data
 
     # Split Background Data into 200k and 150k split
-    tokenized_data_background_200k = {key: value[:200000] for key, value in tokenized_data_background.items()}  # 200k background data
-    tokenized_data_background_150k = {key: value[200000:] for key, value in tokenized_data_background.items()}  # 150k background data
+    tokenized_data_background_200k = {key: value[:5000] for key, value in tokenized_data_background.items()}  # 200k background data
+    tokenized_data_background_150k = {key: value[5000:] for key, value in tokenized_data_background.items()}  # 150k background data
 
     train_data = jet_ad.merge_tokenized_datasets(tokenized_data_signal_25k, tokenized_data_background_200k)
     test_data = jet_ad.merge_tokenized_datasets(tokenized_data_signal_50k, tokenized_data_background_150k)
@@ -59,7 +59,7 @@ def train():
     loader_test = DataLoader(dataset_test, batch_size=16, shuffle=False)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = JetAnomalyDetector(data=None, verbose=True).to(device)
+    model = JetAnomalyDetector(data=None, verbose=False).to(device)
 
     model.train()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)

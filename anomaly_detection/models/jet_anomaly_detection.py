@@ -139,7 +139,7 @@ class TokenizationModule(nn.Module):
             else:
                 # Tokenize Input Data if cached data not found
                 print("\nGenerating Tokens from Input Data\n")
-                bg_file_path = os.path.join(data_path, "bg_N100_SR_extra.h5")
+                bg_file_path = os.path.join(data_path, "bg_N100_SR.h5")
                 sig_file_path = os.path.join(data_path, "sn_N100_SR.h5")
                 #label_type = 'Background'
                 requested_features = ["part_pt", "part_etarel", "part_phirel"]
@@ -657,7 +657,7 @@ class JetAnomalyDetector(nn.Module):
         num_layers_hlf=4,
         embedding_dim_hlf=256,
         sep_token_id=None,
-        use_sep_token=False,
+        use_sep_token=True,
         use_hlf=False):
 
         super().__init__()
@@ -690,6 +690,9 @@ class JetAnomalyDetector(nn.Module):
         self.backbone = BackboneModel(**model_kwargs)
         self.backbone.to(self.device)
 
+        # Fix LayerNorm initialization in backbone
+        self._initialize_backbone_layernorm()
+
 
         # ========== Downstream Anomaly Detection Head ========== #
         # A second (small) Transformer that processes [CLS2, Jet1_repr, Jet2_repr]
@@ -705,14 +708,44 @@ class JetAnomalyDetector(nn.Module):
         self.downstream_transformer = TransformerEncoder(encoder_layer, num_layers=downstream_num_layers)
         
         # A new CLS token for the downstream classification
-        self.cls_token2 = nn.Parameter(torch.randn(1, 1, embedding_dim))
-        self.sep_token = nn.Parameter(torch.zeros(1, 1, embedding_dim))
+        self.cls_token2 = nn.Parameter(torch.randn(1, 1, embedding_dim) * 0.02)
+        
+        # Only create sep_token if we're actually using it
+        if self.use_sep_token:
+            self.sep_token = nn.Parameter(torch.randn(1, 1, embedding_dim) * 0.02)
 
         # Final classification
         self.final_classifier = nn.Linear(embedding_dim, 1)
+        
+        # Initialize the final classifier properly
+        nn.init.xavier_uniform_(self.final_classifier.weight)
+        # Initialize bias to encourage balanced predictions (log(p/(1-p)) for p=0.5 = 0)
+        nn.init.constant_(self.final_classifier.bias, 0.0)
 
         # Criterion
         #self.criterion = nn.BCEWithLogitsLoss()
+        
+    def _initialize_backbone_layernorm(self):
+        """Properly initialize LayerNorm weights and biases in the backbone."""
+        for name, module in self.backbone.named_modules():
+            if isinstance(module, nn.LayerNorm):
+                # LayerNorm weights should be initialized to 1.0
+                nn.init.constant_(module.weight, 1.0)
+                # LayerNorm biases should be initialized to 0.0
+                nn.init.constant_(module.bias, 0.0)
+                if self.verbose:
+                    print(f"Initialized backbone LayerNorm: {name}")
+    
+    def _initialize_layernorm_weights(self):
+        """Properly initialize LayerNorm weights and biases."""
+        for name, module in self.named_modules():
+            if isinstance(module, nn.LayerNorm):
+                # LayerNorm weights should be initialized to 1.0
+                nn.init.constant_(module.weight, 1.0)
+                # LayerNorm biases should be initialized to 0.0
+                nn.init.constant_(module.bias, 0.0)
+                if self.verbose:
+                    print(f"Initialized LayerNorm: {name}")
         
 
     def forward(self):
@@ -742,34 +775,53 @@ class JetAnomalyDetector(nn.Module):
 
         embeddings_jet1 = self.backbone(jet1)
         embeddings_jet2 = self.backbone(jet2)
+        
+        if self.verbose:
+            print(f"DEBUG: embeddings_jet1.shape: {embeddings_jet1.shape}")
+            print(f"DEBUG: embeddings_jet2.shape: {embeddings_jet2.shape}")
+            print(f"DEBUG: jet1 sample values: {jet1[0, :5]}")
+            print(f"DEBUG: embeddings_jet1 sample values: {embeddings_jet1[0, 0, :5]}")
+
+        # Aggregate sequence embeddings to single vectors per jet
+        # Option 1: Use mean pooling
+        if self.jet_last_emb == 'mean':
+            # Create masks for valid (non-zero) tokens
+            jet1_mask = (jet1 != 0).float().unsqueeze(-1)  # (N, L, 1)
+            jet2_mask = (jet2 != 0).float().unsqueeze(-1)  # (N, L, 1)
+            
+            # Masked mean pooling
+            embeddings_jet1_agg = (embeddings_jet1 * jet1_mask).sum(dim=1) / jet1_mask.sum(dim=1)
+            embeddings_jet2_agg = (embeddings_jet2 * jet2_mask).sum(dim=1) / jet2_mask.sum(dim=1)
+        else:
+            # Option 2: Use the CLS token (first token) if available, or last valid token
+            embeddings_jet1_agg = embeddings_jet1[:, 0, :]  # (N, embedding_dim)
+            embeddings_jet2_agg = embeddings_jet2[:, 0, :]  # (N, embedding_dim)
+        
+        if self.verbose:
+            print(f"DEBUG: embeddings_jet1_agg.shape: {embeddings_jet1_agg.shape}")
+            print(f"DEBUG: embeddings_jet2_agg.shape: {embeddings_jet2_agg.shape}")
 
         # ========== Downstream Anomaly Detection Head ========== #
 
         if self.use_hlf == False: # HLF = high-level features
             if self.use_sep_token:
-                batch_size = embeddings_jet1.size(0)
+                batch_size = embeddings_jet1_agg.size(0)
                 sep_token_expanded = self.sep_token.expand(batch_size, -1, -1)
 
-                if self.jet_last_emb == 'mean':
-                    # Stack: [jet1, SEP, jet2] along sequence dimension
-                    jets_with_separator = torch.stack(
-                        [embeddings_jet1, sep_token_expanded.squeeze(1), embeddings_jet2],
-                        dim=1
-                    )
-                else:
-                    # Concatenate along sequence dimension
-                    jets_with_separator = torch.cat(
-                        [embeddings_jet1, sep_token_expanded, embeddings_jet2],
-                        dim=1
-                    )
+                # Stack: [jet1, SEP, jet2] along sequence dimension
+                jets_with_separator = torch.cat(
+                    [embeddings_jet1_agg.unsqueeze(1), sep_token_expanded, embeddings_jet2_agg.unsqueeze(1)],
+                    dim=1
+                )
             else:
-                if self.jet_last_emb == 'mean':
-                    jets_with_separator = torch.stack([embeddings_jet1, embeddings_jet2], dim=1)
-                else:
-                    jets_with_separator = torch.cat([embeddings_jet1, embeddings_jet2], dim=1)
+                # Stack the two jet representations
+                jets_with_separator = torch.stack([embeddings_jet1_agg, embeddings_jet2_agg], dim=1)
+                
+        if self.verbose:
+            print(f"DEBUG: jets_with_separator.shape: {jets_with_separator.shape}")
 
         # Insert a second CLS token at the front for downstream classification
-        batch_size = embeddings_jet1.size(0)
+        batch_size = embeddings_jet1_agg.size(0)
         cls2_token_expanded = self.cls_token2.expand(batch_size, -1, -1)  # [B, 1, hidden_dim]
 
         # Combine CLS2 + jets (and SEP if used)
